@@ -9,7 +9,7 @@ def test_create_table_ok():
     col1 = Column("id", "int64", np.array([1, 2, 3]))
     col2 = Column("value", "float64", np.array([0.5, 0.7, 0.9]))
 
-    t = Table("t", {"id": col1, "value": col2}, 3)
+    t = Table("t", {"id": col1, "value": col2})
 
     assert t.name == "t"
     assert t.row_count == 3
@@ -22,14 +22,14 @@ def test_mismatched_column_lengths_raises():
     col2 = Column("value", "float64", np.array([0.5, 0.7, 0.9]))
 
     with pytest.raises(QueryError):
-        Table("t", {"id": col1, "value": col2}, 4)
+        Table("t", {"id": col1, "value": col2})
 
 
 def test_unknown_column_raises():
     col1 = Column("id", "int64", np.array([1, 2, 3]))
     col2 = Column("value", "float64", np.array([0.5, 0.7, 0.9]))
 
-    t = Table("t", {"id": col1, "value": col2}, 3)
+    t = Table("t", {"id": col1, "value": col2})
 
     with pytest.raises(QueryError):
         t.get_column("name")
