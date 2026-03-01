@@ -1,0 +1,4 @@
+id,category,value,active
+1,A,0.5,true
+2,B,0.9,false
+3,A,1.2,true
