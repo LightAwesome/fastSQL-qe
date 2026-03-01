@@ -49,6 +49,7 @@ def load_csv(path: str, table_name: str = "t") -> Table:
                     f"Row {data_row_idx} has {len(row)} fields but header has {len(header)}"
                 )
             for j, cell in enumerate(row):
+                cell = cell.strip()
                 if cell == "":
                     raise QueryError(
                         f"Empty cell at row {data_row_idx}, column '{header[j]}'"
