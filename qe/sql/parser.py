@@ -1,6 +1,7 @@
-from errors import QueryError
-from sql.ast import *
-from sql.tokenizer import TT, Token, Tokenizer
+from qe.errors import QueryError
+
+from .ast import *
+from .tokenizer import TT, Token, Tokenizer
 
 # Binding powers (higher = tighter binding)
 BP = {
@@ -52,7 +53,6 @@ class Parser:
             return True
         return False
 
-    # --- Top-level ---
     def parse(self) -> SelectQuery:
         is_explain = False
         if self.peek_type() == TT.EXPLAIN:
@@ -80,7 +80,7 @@ class Parser:
         if self.peek_type() == TT.LIMIT:
             self.advance()
             limit = self.expect(TT.INT).value
-        # consume optional semicolon
+
         if self.peek_type() == TT.SEMICOLON:
             self.advance()
         if self.peek_type() != TT.EOF:
