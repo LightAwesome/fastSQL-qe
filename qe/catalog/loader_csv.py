@@ -1,14 +1,13 @@
 import csv
 
 import numpy as np
-from catalog.table import Column, Table
-from errors import QueryError
+
+from qe.catalog.table import Column, Table
+from qe.errors import QueryError
 
 
 def infer_dtype(values: list[str]) -> str:
-    for v in values:
-        if v == "":
-            raise QueryError("NULL/empty values not supported. Clean your data first.")
+    # assumes empties already checked at load time
     try:
         [int(v) for v in values]
         return "int64"
@@ -27,12 +26,11 @@ def infer_dtype(values: list[str]) -> str:
 def cast_column(values: list[str], dtype: str) -> np.ndarray:
     if dtype == "int64":
         return np.array([int(v) for v in values], dtype=np.int64)
-    elif dtype == "float64":
+    if dtype == "float64":
         return np.array([float(v) for v in values], dtype=np.float64)
-    elif dtype == "bool":
+    if dtype == "bool":
         return np.array([v.lower() == "true" for v in values], dtype=bool)
-    else:
-        return np.array(values, dtype=object)
+    return np.array(values, dtype=object)
 
 
 def load_csv(path: str, table_name: str = "t") -> Table:
@@ -43,13 +41,29 @@ def load_csv(path: str, table_name: str = "t") -> Table:
             raise QueryError(f"CSV file is empty: {path}")
         if len(set(header)) != len(header):
             raise QueryError(f"Duplicate column names in CSV: {header}")
-        rows = list(reader)
+
+        rows = []
+        for data_row_idx, row in enumerate(reader, start=1):  # 1-based data rows
+            if len(row) != len(header):
+                raise QueryError(
+                    f"Row {data_row_idx} has {len(row)} fields but header has {len(header)}"
+                )
+            for j, cell in enumerate(row):
+                if cell == "":
+                    raise QueryError(
+                        f"Empty cell at row {data_row_idx}, column '{header[j]}'"
+                    )
+            rows.append(row)
+
     if len(rows) == 0:
         columns = {h: Column(h, "object", np.array([], dtype=object)) for h in header}
         return Table(table_name, columns)
-    col_data = {header[i]: [row[i] for row in rows] for i in range(len(header))}
+
+    # transpose rows -> columns, preserving header order
     columns = {}
-    for name, values in col_data.items():
+    for j, col_name in enumerate(header):
+        values = [row[j] for row in rows]
         dtype = infer_dtype(values)
-        columns[name] = Column(name, dtype, cast_column(values, dtype))
+        columns[col_name] = Column(col_name, dtype, cast_column(values, dtype))
+
     return Table(table_name, columns)
