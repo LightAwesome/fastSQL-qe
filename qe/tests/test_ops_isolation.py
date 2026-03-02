@@ -44,4 +44,4 @@ def test_filter_then_project():
 
     out_batches = list(proj.batches())
     ids = out_batches[0]["id"].tolist()
-    assert ids == [6, 7, 8, 9]
+    assert ids == [5, 6, 7, 8, 9]

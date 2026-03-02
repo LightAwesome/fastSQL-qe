@@ -1,18 +1,74 @@
 from __future__ import annotations
 
-from qe.plan.logical import Aggregate, Filter, Limit, LogicalPlan, Project, Scan, Sort
+from qe.plan.logical import (Aggregate, Filter, Limit, LogicalPlan, Project,
+                             Scan, Sort, TopN)
 from qe.sql.ast import AggFunc, BinOp, ColRef, UnaryOp
 
 
 def optimize(plan: LogicalPlan) -> LogicalPlan:
-    """
-    Minimal optimizer:
-      - Projection pushdown: compute required base-table columns and annotate Scan(needed_cols=...).
-    """
+    plan = _rewrite_topn(plan)
     needed = _required_columns(plan)
     if not needed:
         return plan
     return _annotate_scan(plan, needed)
+
+def _rewrite_topn(plan: LogicalPlan) -> LogicalPlan:
+    # Limit(Sort(child), n)  => TopN(child, order_by, n)
+    if isinstance(plan, Limit) and isinstance(plan.child, Sort):
+        return TopN(plan.child.child, plan.child.order_by, plan.n)
+
+    # recurse
+    if isinstance(plan, Filter):
+        return Filter(_rewrite_topn(plan.child), plan.predicate)
+    if isinstance(plan, Project):
+        return Project(_rewrite_topn(plan.child), plan.select)
+    if isinstance(plan, Aggregate):
+        return Aggregate(_rewrite_topn(plan.child), plan.query)
+    if isinstance(plan, Sort):
+        return Sort(_rewrite_topn(plan.child), plan.order_by)
+    if isinstance(plan, Limit):
+        return Limit(_rewrite_topn(plan.child), plan.n)
+    return plan
+
+
+def _predicate_pushdown(plan: LogicalPlan) -> LogicalPlan:
+    """Recursively push Filter nodes toward the Scan."""
+
+    # Base case: leaf node
+    if isinstance(plan, Scan):
+        return plan
+
+    # Recurse into children first (bottom-up)
+    if isinstance(plan, Filter):
+        child = _predicate_pushdown(plan.child)
+
+        # Filter over Project: push filter below project if safe
+        # Safe when the predicate only references columns available before projection.
+        # (We always push — the analyzer already guarantees predicate cols exist at scan level.)
+        if isinstance(child, Project):
+            return Project(
+                _predicate_pushdown(Filter(child.child, plan.predicate)),
+                child.select,
+            )
+
+        # Filter over Limit: do NOT push — limit semantics would change
+        # Filter over Sort: do NOT push — semantics are preserved but not useful
+        # Filter over Aggregate: do NOT push — predicate may reference aggregate output
+        return Filter(child, plan.predicate)
+
+    if isinstance(plan, Project):
+        return Project(_predicate_pushdown(plan.child), plan.select)
+
+    if isinstance(plan, Aggregate):
+        return Aggregate(_predicate_pushdown(plan.child), plan.query)
+
+    if isinstance(plan, Sort):
+        return Sort(_predicate_pushdown(plan.child), plan.order_by)
+
+    if isinstance(plan, Limit):
+        return Limit(_predicate_pushdown(plan.child), plan.n)
+
+    return plan
 
 
 def _annotate_scan(plan: LogicalPlan, needed: set[str]) -> LogicalPlan:
@@ -32,6 +88,7 @@ def _annotate_scan(plan: LogicalPlan, needed: set[str]) -> LogicalPlan:
 
 
 def _required_columns(plan: LogicalPlan) -> set[str]:
+    """Walk the plan tree and collect every base-table column name referenced."""
     if isinstance(plan, Scan):
         return set()
 
@@ -40,7 +97,7 @@ def _required_columns(plan: LogicalPlan) -> set[str]:
 
     if isinstance(plan, Project):
         base = _required_columns(plan.child)
-        need = set()
+        need: set[str] = set()
         for item in plan.select:
             if isinstance(item.expr, ColRef) and item.expr.name == "*":
                 return set()
@@ -50,7 +107,7 @@ def _required_columns(plan: LogicalPlan) -> set[str]:
     if isinstance(plan, Aggregate):
         base = _required_columns(plan.child)
         q = plan.query
-        need = set()
+        need: set[str] = set()
         if q.group_by:
             for g in q.group_by:
                 if isinstance(g, ColRef) and g.name != "*":

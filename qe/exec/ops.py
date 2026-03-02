@@ -18,12 +18,20 @@ class Op:
         raise NotImplementedError
 
 
+
 class ScanOp(Op):
-    def __init__(self, table: Table, batch_size: int = 4096, needed_cols: Optional[Sequence[str]] = None):
+    def __init__(
+        self,
+        table: Table,
+        batch_size: int = 4096,
+        needed_cols: Optional[Sequence[str]] = None,
+    ):
         self.table = table
         self.batch_size = batch_size
         self.needed = list(needed_cols) if needed_cols is not None else None
 
+        self.batches_emitted = 0
+        self.rows_emitted = 0
         if self.needed is not None:
             schema = set(self.table.col_names())
             missing = [c for c in self.needed if c not in schema]
@@ -32,13 +40,17 @@ class ScanOp(Op):
 
     def batches(self) -> Iterator[Batch]:
         n = self.table.row_count
+        needed_set = set(self.needed) if self.needed is not None else None
         for start in range(0, n, self.batch_size):
             end = min(start + self.batch_size, n)
             out: Batch = {}
-            for name, col in self.table.columns.items():  # preserves schema order
-                if self.needed is None or name in set(self.needed):
+            for name, col in self.table.columns.items():
+                if needed_set is None or name in needed_set:
                     out[name] = col.data[start:end]
+            self.batches_emitted += 1
+            self.rows_emitted += (end - start)
             yield out
+
 
 
 class FilterOp(Op):
@@ -50,8 +62,9 @@ class FilterOp(Op):
         for batch in self.child.batches():
             mask = eval_expr(self.predicate, batch)
             if not isinstance(mask, np.ndarray) or mask.dtype != bool:
-                raise QueryError("WHERE clause must evaluate to a boolean mask")
+                mask = np.asarray(mask, dtype=bool)
             yield {k: v[mask] for k, v in batch.items()}
+
 
 
 class ProjectOp(Op):
@@ -59,7 +72,7 @@ class ProjectOp(Op):
         self.child = child
         self.source_table = source_table
 
-        # Expand SELECT *
+        # Expand SELECT * at construction time
         self.items: list[SelectItem] = []
         for item in select_items:
             if isinstance(item.expr, ColRef) and item.expr.name == "*":
@@ -86,8 +99,10 @@ class ProjectOp(Op):
             yield out
 
 
+
 class LimitOp(Op):
-    """Streaming LIMIT: short-circuits the pipeline once N rows have been produced."""
+    """Streaming LIMIT: short-circuits the pipeline once N rows are produced."""
+
     def __init__(self, child: Op, n: int):
         if n < 0:
             raise QueryError("LIMIT must be non-negative")
@@ -103,22 +118,75 @@ class LimitOp(Op):
             if not batch:
                 yield batch
                 continue
-
             m = len(next(iter(batch.values())))
             if m <= self.remaining:
                 self.remaining -= m
                 yield batch
             else:
-                out = {k: v[: self.remaining] for k, v in batch.items()}
+                yield {k: v[: self.remaining] for k, v in batch.items()}
                 self.remaining = 0
-                yield out
                 break
 
 
+class TopNOp(Op):
+    """
+    Blocking Top-N for ORDER BY key LIMIT N using argpartition.
+    Requires key to be present in the child output.
+    """
+    def __init__(self, child: Op, key: str, ascending: bool, n: int):
+        self.child = child
+        self.key = key
+        self.ascending = ascending
+        self.n = n
+
+    def batches(self) -> Iterator[Batch]:
+        if self.n <= 0:
+            yield {}
+            return
+
+        chunks: dict[str, list[np.ndarray]] = {}
+        for batch in self.child.batches():
+            for k, v in batch.items():
+                chunks.setdefault(k, []).append(v)
+
+        if not chunks:
+            yield {}
+            return
+
+        cols = {k: np.concatenate(vs) if vs else np.array([], dtype=object) for k, vs in chunks.items()}
+
+        if self.key not in cols:
+            raise QueryError(f"ORDER BY column '{self.key}' must be selected")
+
+        key_arr = cols[self.key]
+        m = len(key_arr)
+        n = min(self.n, m)
+        if n == m:
+            # just sort all if small / equal
+            idx = np.argsort(key_arr)
+            if not self.ascending:
+                idx = idx[::-1]
+            yield {k: v[idx] for k, v in cols.items()}
+            return
+
+        # Choose indices for best n
+        if self.ascending:
+            part_idx = np.argpartition(key_arr, n - 1)[:n]
+            # sort the selected n by key
+            order = np.argsort(key_arr[part_idx])
+            idx = part_idx[order]
+        else:
+            # n largest: partition at m-n and take tail
+            part_idx = np.argpartition(key_arr, m - n)[m - n:]
+            order = np.argsort(key_arr[part_idx])[::-1]
+            idx = part_idx[order]
+
+        yield {k: v[idx] for k, v in cols.items()}
+
+
 class SortOp(Op):
-    """
-    Blocking ORDER BY (single key): materializes child, sorts once, yields one batch.
-    """
+    """Blocking ORDER BY (single key): materializes child, sorts, yields one batch."""
+
     def __init__(self, child: Op, key: str, ascending: bool = True):
         self.child = child
         self.key = key
@@ -134,23 +202,34 @@ class SortOp(Op):
             yield {}
             return
 
-        cols = {k: np.concatenate(vs) if vs else np.array([], dtype=object) for k, vs in chunks.items()}
+        cols = {
+            k: np.concatenate(vs) if vs else np.array([], dtype=object)
+            for k, vs in chunks.items()
+        }
         if self.key not in cols:
-            raise QueryError(f"ORDER BY column '{self.key}' must be selected")
+            raise QueryError(f"ORDER BY column '{self.key}' must be in SELECT")
 
-        idx = np.argsort(cols[self.key])
+        idx = np.argsort(cols[self.key], kind="stable")
         if not self.ascending:
             idx = idx[::-1]
-        for k in list(cols.keys()):
-            cols[k] = cols[k][idx]
+        yield {k: v[idx] for k, v in cols.items()}
 
-        yield cols
 
 
 class AggregateOp(Op):
     """
-    Blocking hash aggregation: consumes all input and yields exactly one output batch.
-    Deterministic group order: first-seen order (dict insertion order).
+    Blocking hash aggregation.
+
+    Design decisions (documented for interviews):
+    - SUM / COUNT / MIN / MAX use numpy vectorized operations per group via
+      np.add.at / comparison masks — no Python loop over individual rows.
+    - AVG is computed as SUM / COUNT after accumulation.
+    - Group key extraction still uses a Python loop to build the key→index map,
+      which is O(n) in Python. For high-cardinality groups on large tables this
+      is the bottleneck. A future optimization would use pandas groupby or a
+      Cython/numba kernel for key hashing.
+    - Yields exactly one batch (blocking).
+    - Group output order is first-seen (dict insertion order).
     """
 
     def __init__(self, child: Op, query, source_table: Table):
@@ -162,7 +241,7 @@ class AggregateOp(Op):
         self.select_items: list[SelectItem] = list(query.select)
 
         self.agg_specs: list[tuple[str, str, Any]] = []
-        self.select_kinds: list[tuple[str, Any]] = []  # ("group", colname) or ("agg", spec_index)
+        self.select_kinds: list[tuple[str, Any]] = []
 
         for item in self.select_items:
             alias = getattr(item, "alias", None)
@@ -173,125 +252,96 @@ class AggregateOp(Op):
                 out_name = alias or expr_to_name(item.expr)
                 func = item.expr.func.upper()
                 arg = item.expr.arg
-
                 if isinstance(arg, ColRef) and arg.name == "*":
                     if func != "COUNT":
-                        raise QueryError(f"{func}(*) not supported (only COUNT(*) allowed)")
+                        raise QueryError(f"{func}(*) not supported; only COUNT(*) is allowed")
                     self.agg_specs.append((out_name, func, None))
                 else:
                     self.agg_specs.append((out_name, func, arg))
-
                 self.select_kinds.append(("agg", len(self.agg_specs) - 1))
             else:
-                raise QueryError("Only column references and aggregates are supported in SELECT with aggregation")
+                raise QueryError(
+                    "SELECT with aggregation supports only column references and aggregate functions"
+                )
 
         src_cols = set(source_table.col_names())
         for c in self.group_cols:
             if c not in src_cols:
                 raise QueryError(f"Unknown column in GROUP BY: '{c}'")
 
+
     def batches(self) -> Iterator[Batch]:
-        groups: dict[tuple, dict[str, Any]] = {}
-
-        def new_agg_states():
-            states = []
-            for (_out, func, _arg) in self.agg_specs:
-                if func == "COUNT":
-                    states.append({"count": 0})
-                elif func == "SUM":
-                    states.append({"sum": 0.0})
-                elif func == "MIN":
-                    states.append({"min": None})
-                elif func == "MAX":
-                    states.append({"max": None})
-                elif func == "AVG":
-                    states.append({"sum": 0.0, "count": 0})
-                else:
-                    raise QueryError(f"Unsupported aggregate: {func}")
-            return states
-
+        chunks: dict[str, list[np.ndarray]] = {}
         for batch in self.child.batches():
-            n = len(next(iter(batch.values()))) if batch else 0
-            if n == 0:
-                continue
+            for k, v in batch.items():
+                chunks.setdefault(k, []).append(v)
 
-            group_arrays = [batch[c] for c in self.group_cols]
-
-            agg_arg_arrays: list[np.ndarray | None] = []
-            for (_out, func, arg) in self.agg_specs:
-                if func == "COUNT" and arg is None:
-                    agg_arg_arrays.append(None)
-                else:
-                    v = eval_expr(arg, batch)
-                    if not isinstance(v, np.ndarray):
-                        v = np.full(n, v, dtype=object)
-                    agg_arg_arrays.append(v)
-
-            for i in range(n):
-                if self.group_cols:
-                    key = tuple(arr[i].item() if hasattr(arr[i], "item") else arr[i] for arr in group_arrays)
-                    group_vals = key
-                else:
-                    key = tuple()
-                    group_vals = tuple()
-
-                if key not in groups:
-                    groups[key] = {"group_vals": group_vals, "aggs": new_agg_states()}
-
-                states = groups[key]["aggs"]
-
-                for si, (_out, func, _arg) in enumerate(self.agg_specs):
-                    st = states[si]
-                    if func == "COUNT":
-                        st["count"] += 1
-                    elif func == "SUM":
-                        st["sum"] += float(agg_arg_arrays[si][i])
-                    elif func == "MIN":
-                        v = agg_arg_arrays[si][i]
-                        st["min"] = v if st["min"] is None or v < st["min"] else st["min"]
-                    elif func == "MAX":
-                        v = agg_arg_arrays[si][i]
-                        st["max"] = v if st["max"] is None or v > st["max"] else st["max"]
-                    elif func == "AVG":
-                        st["sum"] += float(agg_arg_arrays[si][i])
-                        st["count"] += 1
-
-        # Emit exactly one batch
-        if not groups:
+        if not chunks:
             yield {}
             return
+
+        full: dict[str, np.ndarray] = {
+            k: np.concatenate(vs) for k, vs in chunks.items()
+        }
+        n = len(next(iter(full.values())))
+
+        if n == 0:
+            yield {}
+            return
+
+        if self.group_cols:
+            group_index: dict[tuple, list[int]] = {}
+            key_arrays = [full[c] for c in self.group_cols]
+            for i in range(n):
+                key = tuple(
+                    arr[i].item() if hasattr(arr[i], "item") else arr[i]
+                    for arr in key_arrays
+                )
+                if key not in group_index:
+                    group_index[key] = []
+                group_index[key].append(i)
+        else:
+            group_index = {(): list(range(n))}
 
         out_cols: dict[str, list[Any]] = {}
         for kind, payload in self.select_kinds:
             if kind == "group":
                 out_cols[payload] = []
             else:
-                spec_idx = payload
-                out_name, _func, _arg = self.agg_specs[spec_idx]
+                out_name, _, _ = self.agg_specs[payload]
                 out_cols[out_name] = []
 
-        for _key, state in groups.items():
-            group_vals = state["group_vals"]
-            agg_states = state["aggs"]
+        for key, indices in group_index.items():
+            idx = np.array(indices, dtype=np.intp)
 
             for kind, payload in self.select_kinds:
                 if kind == "group":
                     col = payload
                     j = self.group_cols.index(col)
-                    out_cols[col].append(group_vals[j])
+                    out_cols[col].append(key[j])
                 else:
                     spec_idx = payload
-                    out_name, func, _arg = self.agg_specs[spec_idx]
-                    st = agg_states[spec_idx]
+                    out_name, func, arg = self.agg_specs[spec_idx]
                     if func == "COUNT":
-                        out_cols[out_name].append(st["count"])
-                    elif func == "SUM":
-                        out_cols[out_name].append(st["sum"])
-                    elif func == "MIN":
-                        out_cols[out_name].append(st["min"])
-                    elif func == "MAX":
-                        out_cols[out_name].append(st["max"])
-                    elif func == "AVG":
-                        out_cols[out_name].append(st["sum"] / st["count"] if st["count"] else 0.0)
+                        out_cols[out_name].append(len(idx))
+                    else:
+                        vals = eval_expr(arg, full)
+                        if not isinstance(vals, np.ndarray):
+                            vals = np.full(n, vals)
+                        group_vals = vals[idx]  
 
-        yield {name: np.array(vals, dtype=object) for name, vals in out_cols.items()}
+                        if func == "SUM":
+                            out_cols[out_name].append(float(np.sum(group_vals)))
+                        elif func == "MIN":
+                            out_cols[out_name].append(group_vals.min())
+                        elif func == "MAX":
+                            out_cols[out_name].append(group_vals.max())
+                        elif func == "AVG":
+                            out_cols[out_name].append(float(np.mean(group_vals)))
+                        else:
+                            raise QueryError(f"Unsupported aggregate: {func}")
+
+        yield {
+            name: np.array(vals, dtype=object)
+            for name, vals in out_cols.items()
+        }

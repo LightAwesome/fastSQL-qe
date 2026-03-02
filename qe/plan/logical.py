@@ -11,6 +11,13 @@ class LogicalPlan:
 
 
 @dataclass(frozen=True)
+class TopN(LogicalPlan):
+    child: LogicalPlan
+    order_by: OrderByItem
+    n: int
+
+
+@dataclass(frozen=True)
 class Scan(LogicalPlan):
     table_name: str
     needed_cols: Optional[Sequence[str]] = None
