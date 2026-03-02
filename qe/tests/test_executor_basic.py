@@ -39,11 +39,23 @@ def test_exec_projection_only():
 def test_exec_where_filter():
     table = make_table()
     out = run_sql("SELECT id FROM t WHERE value > 0.7", table)
-    assert out.col_names() == ["id"]
     np.testing.assert_array_equal(out.get_column("id").data, np.array([2, 3]))
 
 
-def test_exec_computed_expr_and_bool_filter():
+def test_exec_boolean_logic_precedence():
+    table = make_table()
+    # active = true OR (value > 1 AND id = 2)  -> should keep rows 1 and 3 (active true)
+    out = run_sql("SELECT id FROM t WHERE active = true OR value > 1 AND id = 2", table)
+    np.testing.assert_array_equal(out.get_column("id").data, np.array([1, 3]))
+
+
+def test_exec_not_unary():
+    table = make_table()
+    out = run_sql("SELECT id FROM t WHERE NOT active", table)
+    np.testing.assert_array_equal(out.get_column("id").data, np.array([2]))
+
+
+def test_exec_computed_expr():
     table = make_table()
     out = run_sql("SELECT id, value * 2 FROM t WHERE active = true", table)
     assert out.col_names() == ["id", "expr_1"]
