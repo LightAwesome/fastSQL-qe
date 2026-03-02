@@ -3,66 +3,40 @@ from __future__ import annotations
 import numpy as np
 
 from qe.catalog.table import Column, Table
-from qe.errors import QueryError
-from qe.exec.ops import AggregateOp, FilterOp, ProjectOp, ScanOp
-from qe.sql.ast import AggFunc, ColRef, SelectQuery
-
-
-def _concat(chunks: list[np.ndarray]) -> np.ndarray:
-    if not chunks:
-        return np.array([], dtype=object)
-    return np.concatenate(chunks, axis=0)
+from qe.exec.compiler import compile_plan
+from qe.plan.explain import explain
+from qe.plan.optimizer import optimize
+from qe.plan.planner import build_logical_plan
+from qe.sql.ast import SelectQuery
 
 
 def _materialize(op) -> dict[str, np.ndarray]:
-    collected: dict[str, list[np.ndarray]] = {}
+    chunks: dict[str, list[np.ndarray]] = {}
     for batch in op.batches():
-        for name, arr in batch.items():
-            collected.setdefault(name, []).append(arr)
+        for k, v in batch.items():
+            chunks.setdefault(k, []).append(v)
+    return {
+        k: (np.concatenate(vs) if vs else np.array([], dtype=object))
+        for k, vs in chunks.items()
+    }
 
-    out: dict[str, np.ndarray] = {}
-    for name in collected.keys():
-        out[name] = _concat(collected[name])
-    return out
 
+def execute(
+    query: SelectQuery,
+    table: Table,
+    batch_size: int = 4096,
+    optimize_plan: bool = True,
+    return_explain: bool = False,
+):
+    plan = build_logical_plan(query)
+    plan_opt = optimize(plan) if optimize_plan else plan
 
-def execute(query: SelectQuery, table: Table, batch_size: int = 4096) -> Table:
-    op = ScanOp(table, batch_size=batch_size)
+    op = compile_plan(plan_opt, table, batch_size=batch_size)
+    out_cols = _materialize(op)
 
-    if query.where is not None:
-        from qe.exec.ops import FilterOp
+    result = Table("result", {k: Column(k, "object", v) for k, v in out_cols.items()})
 
-        op = FilterOp(op, query.where)
+    if return_explain:
+        return result, explain(plan), explain(plan_opt)
 
-    has_agg = any(isinstance(item.expr, AggFunc) for item in query.select)
-
-    if query.group_by or has_agg:
-        op = AggregateOp(op, query, source_table=table)
-        out_cols = _materialize(op)
-    else:
-        op = ProjectOp(op, query.select, source_table=table)
-        out_cols = _materialize(op)
-
-    if query.order_by:
-        if len(query.order_by) != 1:
-            raise QueryError("Only single-key ORDER BY is supported")
-        ob = query.order_by[0]
-        if not isinstance(ob.expr, ColRef):
-            raise QueryError("ORDER BY only supports column references")
-        key = ob.expr.name
-        if key not in out_cols:
-            raise QueryError(f"ORDER BY column '{key}' must be selected")
-        idx = np.argsort(out_cols[key])
-        if not ob.ascending:
-            idx = idx[::-1]
-        for name in list(out_cols.keys()):
-            out_cols[name] = out_cols[name][idx]
-
-    if query.limit is not None:
-        if query.limit < 0:
-            raise QueryError("LIMIT must be non-negative")
-        for name in list(out_cols.keys()):
-            out_cols[name] = out_cols[name][: query.limit]
-
-    columns = {name: Column(name, "object", arr) for name, arr in out_cols.items()}
-    return Table("result", columns)
+    return result
