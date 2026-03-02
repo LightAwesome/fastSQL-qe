@@ -24,7 +24,7 @@ def make_table():
 def test_analyze_ok_simple_where():
     table = make_table()
     q = Parser("SELECT id FROM t WHERE value > 0.7").parse()
-    analyze(q, table)  # should not raise
+    analyze(q, table)
 
 
 def test_unknown_column_in_where_raises():
@@ -58,7 +58,7 @@ def test_mixing_agg_and_nonagg_without_group_by_raises():
 def test_group_by_missing_nonagg_column_raises():
     table = make_table()
     q = Parser("SELECT category, id, SUM(value) FROM t GROUP BY category").parse()
-    # id is non-agg but not in group by -> should error
+
     with pytest.raises(QueryError):
         analyze(q, table)
 
@@ -66,4 +66,15 @@ def test_group_by_missing_nonagg_column_raises():
 def test_group_by_ok():
     table = make_table()
     q = Parser("SELECT category, SUM(value) FROM t GROUP BY category").parse()
-    analyze(q, table)  # should not raise
+    analyze(q, table)
+
+
+def test_whole_table_agg_with_constant_is_allowed():
+    table = make_table()
+    q = Parser("SELECT SUM(value), 1 FROM t").parse()
+    analyze(q, table)
+
+
+def test_sum_star_rejected():
+    with pytest.raises(QueryError):
+        Parser("SELECT SUM(*) FROM t").parse()
